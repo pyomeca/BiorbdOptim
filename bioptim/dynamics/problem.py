@@ -427,7 +427,7 @@ class Problem:
         Problem.configure_qdot(nlp, as_states, as_controls)
 
     @staticmethod
-    def configure_tau(nlp, as_states: bool, as_controls: bool):
+    def configure_tau(nlp, as_states: bool, as_controls: bool, is_fatigable: bool = False):
         """
         Configure the generalized forces
 
@@ -440,6 +440,9 @@ class Problem:
         as_controls: bool
             If the generalized forces should be a control
         """
+
+        if is_fatigable:
+            raise NotImplementedError(f"Dynamics with {nlp.control_type} is not implemented yet")
 
         if nlp.mapping["tau"] is None:
             nlp.mapping["tau"] = BiMapping(
