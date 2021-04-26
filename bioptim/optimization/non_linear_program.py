@@ -143,7 +143,7 @@ class NonLinearProgram:
         self.plot = {}
         self.q = None
         self.qdot = None
-        self.fatigable = None
+        self.fatigable_tau = {}
         self.shape = {}
         self.tau = None
         self.t0 = None
