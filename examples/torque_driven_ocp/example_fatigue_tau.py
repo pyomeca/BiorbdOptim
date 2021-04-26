@@ -8,6 +8,7 @@ from bioptim import (
     DynamicsFcn,
     DynamicsFunctions,
     Dynamics,
+    DynamicsList,
     Bounds,
     BoundsList,
     BiMapping,
@@ -15,17 +16,38 @@ from bioptim import (
     InitialGuess,
     ObjectiveFcn,
     Objective,
+    OdeSolver,
     Problem,
     NonLinearProgram,
-    #  PlotType
+    PlotType,
+    Solution,
+    Shooting
 )
 
 TL = 30
 LD = 10
 LR = 10
-F = 0.1
-R = 0.02
-global_tau_max = [100, 0]
+F = 0.5
+R = 0.01
+global_tau_max = [11, 0.1]
+
+def custom_plot_callback(x: MX, q_to_plot: list) -> MX:
+    """
+    Create a used defined plot function with extra_parameters
+
+    Parameters
+    ----------
+    x: MX
+        The current states of the optimization
+    q_to_plot: list
+        The slice indices to plot
+
+    Returns
+    -------
+    The value to plot
+    """
+
+    return x[q_to_plot, :]
 
 def custom_dynamic(
     states: Union[MX, SX], controls: Union[MX, SX], parameters: Union[MX, SX], nlp: NonLinearProgram
@@ -54,34 +76,53 @@ def custom_dynamic(
 
     nq = nlp.shape["q"]
     nqdot = nlp.shape["qdot"]
+    n_tau = nlp.shape["tau"]
+    n_fatigable_ma = nlp.shape["tau"]
+    n_fatigable_mr = nlp.shape["tau"]
+    n_fatigable_mf = nlp.shape["tau"]
 
-    n_fatigable = nlp.mapping["fatigable_tau"].to_first.len
-    fatigable = nlp.mapping["fatigable_tau"].to_second.map(states[nq + nqdot:])
+    nlp.mapping = {
+        "q": BiMapping(range(nq), range(nq)),
+        "qdot": BiMapping(range(nqdot), range(nqdot)),
+        "tau": BiMapping(range(n_tau), range(n_tau)),
+        "fatigable_tau_ma": BiMapping(range(n_fatigable_ma), range(n_fatigable_ma)),
+        "fatigable_tau_mr": BiMapping(range(n_fatigable_mr), range(n_fatigable_mr)),
+        "fatigable_tau_mf": BiMapping(range(n_fatigable_mf), range(n_fatigable_mf))
+    }
 
-    fatigable_dot = MX()
+    # n_fatigable = nlp.mapping["fatigable_tau"].to_first.len
+    fatigable_ma = nlp.mapping["fatigable_tau_ma"].to_second.map(states[nq + nqdot:nq + nqdot + n_fatigable_ma + 1])
+    fatigable_mr = nlp.mapping["fatigable_tau_mr"].to_second.map(
+        states[nq + nqdot + n_fatigable_ma:nq + nqdot + n_fatigable_ma + n_fatigable_mr + 1])
+    fatigable_mf = nlp.mapping["fatigable_tau_mr"].to_second.map(
+        states[nq + nqdot + n_fatigable_ma + n_fatigable_mr:])
+
+    fatigable_ma_dot = MX()
+    fatigable_mr_dot = MX()
+    fatigable_mf_dot = MX()
     effective_tau = MX()
     for i in range(nlp.shape["tau"]):
 
-        ma = fatigable[0 + 3*i, 0]
-        mr = fatigable[1 + 3*i, 0]
-        mf = fatigable[2 + 3 * i, 0]
-        TL = tau[i]/global_tau_max[i]
+        ma = fatigable_ma[i, 0]
+        mr = fatigable_mr[i, 0]
+        mf = fatigable_mf[i, 0]
+        TL = tau[i]/global_tau_max[i]  # Target load
 
-        c= if_else (lt(ma, TL), if_else(gt(mr, TL-ma), LD * (TL - ma), LD * mr), LR * (TL - ma))
+        c = if_else(lt(ma, TL), if_else(gt(mr, TL-ma), LD * (TL - ma), LD * mr), LR * (TL - ma))
 
         madot = c - F * ma
         mrdot = -c + R * mf
         mfdot = F * ma - R * mf
 
-        fatigable_dot = vertcat(fatigable_dot, madot)
-        fatigable_dot = vertcat(fatigable_dot, mrdot)
-        fatigable_dot = vertcat(fatigable_dot, mfdot)
+        fatigable_ma_dot = vertcat(fatigable_ma_dot, madot)
+        fatigable_mr_dot = vertcat(fatigable_mr_dot, mrdot)
+        fatigable_mf_dot = vertcat(fatigable_mf_dot, mfdot)
 
         effective_tau = vertcat(effective_tau, ma*global_tau_max[i])
 
     qddot = nlp.model.ForwardDynamics(q, qdot, effective_tau).to_mx()
 
-    return qdot, qddot, fatigable_dot
+    return qdot, qddot, fatigable_ma_dot, fatigable_mr_dot, fatigable_mf_dot
 
 
 def custom_configure(ocp: OptimalControlProgram, nlp: NonLinearProgram):
@@ -104,29 +145,54 @@ def custom_configure(ocp: OptimalControlProgram, nlp: NonLinearProgram):
         nlp.mapping["tau"] = BiMapping(range(nlp.model.nbGeneralizedTorque()), range(nlp.model.nbGeneralizedTorque()))
 
     dof_names = nlp.model.nameDof()
-    fatigable_mx = MX()
-    fatigable = nlp.cx()
+    fatigable_ma_mx = MX()
+    fatigable_mr_mx = MX()
+    fatigable_mf_mx = MX()
+    fatigable_ma = nlp.cx()
+    fatigable_mr = nlp.cx()
+    fatigable_mf = nlp.cx()
 
     for i in nlp.mapping["tau"].to_first.map_idx:
-        fatigable = vertcat(fatigable, nlp.cx.sym("Fatigable_tau_" + dof_names[i].to_string(), 3, 1))
+        fatigable_ma = vertcat(fatigable_ma, MX.sym("Fatigable_tau_ma_" + dof_names[i].to_string(), 1, 1))
+        fatigable_mr = vertcat(fatigable_mr, MX.sym("Fatigable_tau_mr_" + dof_names[i].to_string(), 1, 1))
+        fatigable_mf = vertcat(fatigable_mf, MX.sym("Fatigable_tau_mf_" + dof_names[i].to_string(), 1, 1))
+
     for i, _ in enumerate(nlp.mapping["tau"].to_second.map_idx):
-        fatigable_mx = vertcat(fatigable_mx, MX.sym("Fatigable_tau_mx_" + dof_names[i].to_string(), 3, 1))
+        fatigable_ma_mx = vertcat(fatigable_ma_mx, nlp.cx.sym("Fatigable_tau_ma_mx_" + dof_names[i].to_string(), 1, 1))
+        fatigable_mr_mx = vertcat(fatigable_mr_mx, nlp.cx.sym("Fatigable_tau_mr_mx_" + dof_names[i].to_string(), 1, 1))
+        fatigable_mf_mx = vertcat(fatigable_mf_mx, nlp.cx.sym("Fatigable_tau_mf_mx_" + dof_names[i].to_string(), 1, 1))
 
-    nlp.shape["fatigable_tau"] = nlp.mapping["tau"].to_first.len*3
+    nlp.shape["fatigable_tau_ma"] = nlp.mapping["tau"].to_first.len
+    nlp.shape["fatigable_tau_mr"] = nlp.mapping["tau"].to_first.len
+    nlp.shape["fatigable_tau_mf"] = nlp.mapping["tau"].to_first.len
 
-    legend_fatigable_tau = ["fatigable_tau_" + nlp.model.nameDof()[idx].to_string() for idx in nlp.mapping["tau"].to_first.map_idx]
+    nlp.fatigable_tau = {
+        "fatigable_ma": MX(),
+        "fatigable_mr": MX(),
+        "fatigable_mf": MX()
+    }
 
-    nlp.fatigable = fatigable_mx
-    nlp.x = vertcat(nlp.x, fatigable)
-    nlp.var_states["fatigable_tau"] = nlp.shape["fatigable_tau"]
-    # q_bounds = nlp.x_bounds[nlp.shape["q"]+nlp.shape["qdot"]: nlp.shape["q"]+nlp.shape["qdot"]+nlp.shape["fatigable_tau"]]
+    nlp.fatigable_tau['fatigable_ma'] = fatigable_ma_mx
+    nlp.fatigable_tau['fatigable_mr'] = fatigable_mr_mx
+    nlp.fatigable_tau['fatigable_mf'] = fatigable_mf_mx
+    nlp.x = vertcat(nlp.x, fatigable_ma)
+    nlp.x = vertcat(nlp.x, fatigable_mr)
+    nlp.x = vertcat(nlp.x, fatigable_mf)
+    nlp.var_states["fatigable_tau_ma"] = nlp.shape["fatigable_tau_ma"]
+    nlp.var_states["fatigable_tau_mr"] = nlp.shape["fatigable_tau_mr"]
+    nlp.var_states["fatigable_tau_mf"] = nlp.shape["fatigable_tau_mf"]
 
-    # nlp.plot["fatigable_tau"] = CustomPlot(
-    #     lambda x, u, p: x[nlp.shape["q"]+nlp.shape["qdot"]: nlp.shape["q"]+nlp.shape["qdot"]+nlp.shape["fatigable_tau"]],
-    #     plot_type=PlotType.INTEGRATED,
-    #     legend=legend_q,
-    #     bounds=q_bounds,
-    # )
+    legend_fatigable_tau_ma = ["fatigable_tau_ma_" + nlp.model.nameDof()[idx].to_string() for idx in
+                            nlp.mapping["tau"].to_first.map_idx]
+    legend_fatigable_tau_mr = ["fatigable_tau_mr_" + nlp.model.nameDof()[idx].to_string() for idx in
+                               nlp.mapping["tau"].to_first.map_idx]
+    legend_fatigable_tau_mf = ["fatigable_tau_mf_" + nlp.model.nameDof()[idx].to_string() for idx in
+                               nlp.mapping["tau"].to_first.map_idx]
+    legend_fatigable_tau = legend_fatigable_tau_ma + legend_fatigable_tau_mr + legend_fatigable_tau_mf
+    ocp.add_plot("My New Extra Plot",
+                 lambda x, u, p: custom_plot_callback(x, [4, 5, 6, 7, 8, 9]),
+                 plot_type=PlotType.PLOT,
+                 legend=legend_fatigable_tau)
 
     nlp.nx = nlp.x.rows()
 
@@ -134,7 +200,12 @@ def custom_configure(ocp: OptimalControlProgram, nlp: NonLinearProgram):
 
 
 
-def prepare_ocp(biorbd_model_path: str, final_time: float, n_shooting: int) -> OptimalControlProgram:
+def prepare_ocp(biorbd_model_path: str,
+                final_time: float,
+                n_shooting: int,
+                ode_solver: OdeSolver = OdeSolver.RK4(),
+                use_sx: bool = False,
+                ) -> OptimalControlProgram:
     """
     The initialization of an ocp
 
@@ -158,7 +229,8 @@ def prepare_ocp(biorbd_model_path: str, final_time: float, n_shooting: int) -> O
     objective_functions = Objective(ObjectiveFcn.Lagrange.MINIMIZE_TORQUE)
 
     # Dynamics
-    dynamics = Dynamics(DynamicsFcn.TORQUE_DRIVEN)
+    dynamics = DynamicsList()
+    dynamics.add(custom_configure, dynamic_function=custom_dynamic)
 
     # Path constraint
     x_bounds = BoundsList()
@@ -201,22 +273,6 @@ def prepare_ocp(biorbd_model_path: str, final_time: float, n_shooting: int) -> O
 
     x_bounds.add(min_bounds, max_bounds)
 
-    # Define ma, mr, mf as states with initial_state = (ma, mr, mf) = (0, 1, 0) and final_state = (0, 0, 1)
-    # 0 ≤ ma, mr, mf ≤ 1
-
-    # x_bounds.min[[4, 5, 6], :] = 0
-    # x_bounds.max[[4, 5, 6], :] = 1
-    #
-    # initial_state = (0, 1, 0)
-    # x_bounds[4, 0] = initial_state[0]  # ma
-    # x_bounds[5, 0] = initial_state[1]  # mr
-    # x_bounds[6, 0] = initial_state[2]  # mf
-    #
-    # final_state = (0, 0, 1)
-    # x_bounds[4, -1] = final_state[0]  # ma
-    # x_bounds[5, -1] = final_state[1]  # mr
-    # x_bounds[6, -1] = final_state[2]  # mf
-
     # Initial guess
     n_tau = biorbd_model.nbGeneralizedTorque()
 
@@ -244,6 +300,8 @@ def prepare_ocp(biorbd_model_path: str, final_time: float, n_shooting: int) -> O
         x_bounds=x_bounds,
         u_bounds=u_bounds,
         objective_functions=objective_functions,
+        ode_solver=ode_solver,
+        use_sx=use_sx
     )
 
 
@@ -255,9 +313,31 @@ if __name__ == "__main__":
     # --- Prepare the ocp --- #
     ocp = prepare_ocp(biorbd_model_path="pendulum.bioMod", final_time=3, n_shooting=100)
 
+    # --- Test initial guess with single shooting --- #
+
+    # n_tau = 2
+    # n_q = 2
+    # n_qdot = 2
+    # tau_init = 0
+    #
+    # u_init = InitialGuess([tau_init] * n_tau)
+    # x_init = InitialGuess([0] * (n_q + n_qdot))
+    # x_init.concatenate(InitialGuess([0] * n_tau))  # ma
+    # x_init.concatenate(InitialGuess([1] * n_tau))  # mr
+    # x_init.concatenate(InitialGuess([0] * n_tau))  # mf
+    #
+    # sol_from_initial_guess = Solution(ocp, [x_init, u_init])
+    # s = sol_from_initial_guess.integrate(shooting_type=Shooting.SINGLE_CONTINUOUS)
+    # print(f"Final position of q from single shooting of initial guess = {s.states['q'][:, -1]}")
+    # s.animate()
+
     # --- Solve the ocp --- #
     sol = ocp.solve(show_online_optim=True)
+    s_single = sol.integrate(shooting_type=Shooting.SINGLE_CONTINUOUS)
+    sol.graphs(shooting_type=Shooting.SINGLE_CONTINUOUS)
+    s_single.animate()
 
     # --- Show the results in a bioviz animation --- #
     sol.print()
+    sol.graphs()
     sol.animate()
