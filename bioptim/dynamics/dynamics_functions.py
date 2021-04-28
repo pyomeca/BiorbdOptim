@@ -53,6 +53,8 @@ class DynamicsFunctions:
         Contact forces of a forward dynamics driven by muscle excitations and joint torques with contact constraints.
     dispatch_q_qdot_tau_data(states: MX.sym, controls: MX.sym, nlp: NonLinearProgram) -> tuple[MX.sym, MX.sym, MX.sym]
         Extracting q, qdot and tau from states and controls, assuming state, state and control, respectively.
+    dispatch_q_qdot_data(states: MX.sym, controls: MX.sym, nlp) -> tuple
+        Extracting q and qdot from states and controls, assuming state, state and control, respectively.
     apply_parameters(parameters: MX.sym, nlp: NonLinearProgram)
         Apply the parameter variables to the model. This should be called before calling the dynamics
     """
@@ -662,6 +664,34 @@ class DynamicsFunctions:
         tau = nlp.mapping["tau"].to_second.map(controls[: nlp.shape["tau"]])
 
         return q, qdot, tau
+
+    @staticmethod
+    def dispatch_q_qdot_data(states: MX.sym, controls: MX.sym, nlp) -> tuple:
+        """
+        Extracting q and qdot from states and controls, assuming state, state and control, respectively.
+
+        Parameters
+        ----------
+        states: MX.sym
+            The state of the system
+        controls: MX.sym
+            The controls of the system
+        nlp: NonLinearProgram
+            The definition of the system
+
+        Returns
+        ----------
+        MX.sym
+            q, the generalized coordinates
+        MX.sym
+            qdot, the generalized velocities
+        """
+
+        nq = nlp.mapping["q"].to_first.len
+        q = nlp.mapping["q"].to_second.map(states[:nq])
+        qdot = nlp.mapping["qdot"].to_second.map(states[nq:])
+
+        return q, qdot
 
     @staticmethod
     def apply_parameters(parameters: MX.sym, nlp):
